@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Run a computer-use Vibe session that asks for approval on Telegram.
 
-Starts Baton's server (remote/baton) on this checkout's vibe-acp, then Baton's
-Telegram bridge. In the authorized Telegram chat, send /new and then a request;
-every computer-use action the model wants to take arrives as a card with
-"Allow once" and "Deny" buttons.
+Two ways, both using Baton (remote/baton) and its Telegram bridge:
 
+- --native: open the Vibe terminal UI here and work in it as usual; every
+  approval it would ask for arrives in Telegram instead, as a card with
+  "Allow once" and "Deny" buttons (Baton's native.sh).
+- default: start Baton's server on this checkout's vibe-acp. In the Telegram
+  chat, send /new and then a request; approvals arrive there as cards.
+
+    uv run python remote/telegram_computer_use.py --native [--cwd DIR]
     uv run python remote/telegram_computer_use.py [--cwd DIR] [--port 8765]
 
 Needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, from the environment or
@@ -37,6 +41,27 @@ BATON = REPO / "remote" / "baton"
 SERVER_NAME = "computer-use"
 # Input tools: each must reach the operator, so none may be auto-approved.
 INPUT_TOOLS = ("click", "drag", "scroll", "type_text", "press_keys")
+# Only the Telegram bridge may hold these. Vibe's tools inherit the environment of
+# the process that runs Vibe, so the model could otherwise read the bot token.
+TELEGRAM_ONLY = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
+
+
+def split_env(env: Mapping[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    """The environment for processes that run Vibe, and the one for the bridge."""
+    vibe = {key: value for key, value in env.items() if key not in TELEGRAM_ONLY}
+    return vibe, dict(env)
+
+
+def native_command(workdir: Path, approval_policy: str) -> list[str]:
+    """Baton's native.sh: the installed Vibe TUI with approvals routed to Baton."""
+    return [
+        "bash",
+        str(BATON / "native.sh"),
+        "--trust",
+        "--workdir",
+        str(workdir),
+        f"--approval-policy={approval_policy}",
+    ]
 
 
 def vibe_home() -> Path:
@@ -174,28 +199,64 @@ def stop(processes: list[subprocess.Popen[bytes]]) -> None:
             os.killpg(process.pid, signal.SIGKILL)
 
 
+UV_PYTHON = ["uv", "run", "--project", str(BATON), "python", "-u"]
+
+
+def start_bridge(
+    env: dict[str, str], log: Path | None = None
+) -> subprocess.Popen[bytes]:
+    """Baton's Telegram bridge, in its own process group; quiet when `log` is set."""
+    command = [*UV_PYTHON, str(BATON / "tools" / "telegram_bridge.py")]
+    if log is None:
+        return subprocess.Popen(command, cwd=BATON, env=env, start_new_session=True)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("ab") as output:
+        return subprocess.Popen(
+            command,
+            cwd=BATON,
+            env=env,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+
+def run_native(
+    env: dict[str, str], workdir: Path, approval_policy: str, bridge_log: Path
+) -> int:
+    """Run the Vibe TUI in this terminal with the Telegram bridge behind it."""
+    vibe_env, bridge_env = split_env(env)
+    processes: list[subprocess.Popen[bytes]] = []
+    try:
+        # The bridge retries until the TUI's Baton listener is up.
+        processes.append(start_bridge(bridge_env, bridge_log))
+        print(f"Telegram bridge started; its log is {bridge_log}.")
+        tui = subprocess.Popen(native_command(workdir, approval_policy), env=vibe_env)
+        # The TUI reads Ctrl+C itself; keep a stray SIGINT from stopping the bridge.
+        previous = signal.signal(signal.SIGINT, lambda *_: None)
+        try:
+            return tui.wait()
+        finally:
+            signal.signal(signal.SIGINT, previous)
+    finally:
+        stop(processes)
+
+
 def run(env: dict[str, str], workdir: Path, port: int) -> int:
     """Start Baton's server, then its Telegram bridge, and wait until one stops."""
     http = f"http://127.0.0.1:{port}"
-    uv = ["uv", "run", "--project", str(BATON), "python", "-u"]
+    vibe_env, bridge_env = split_env(env)
     processes: list[subprocess.Popen[bytes]] = []
     try:
         server = subprocess.Popen(
-            [*uv, str(BATON / "server.py")],
+            [*UV_PYTHON, str(BATON / "server.py")],
             cwd=workdir,
-            env=env,
+            env=vibe_env,
             start_new_session=True,
         )
         processes.append(server)
         wait_until_up(f"{http}/", server, seconds=60)
-        processes.append(
-            subprocess.Popen(
-                [*uv, str(BATON / "tools" / "telegram_bridge.py")],
-                cwd=BATON,
-                env=env,
-                start_new_session=True,
-            )
-        )
+        processes.append(start_bridge(bridge_env))
         print(
             f"\nBaton is up, working in {workdir}.\n"
             "In your Telegram chat with the bot: send /start, then /new, then your "
@@ -225,9 +286,25 @@ def main() -> int:
         default=BATON / "demo",
         help="Folder the Vibe sessions work in (default: Baton's sacrificial demo repo).",
     )
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--native",
+        action="store_true",
+        help="Open the Vibe TUI here and send its approvals to Telegram.",
+    )
+    parser.add_argument(
+        "--approval-policy",
+        default="accept-edits",
+        help="With --native, Vibe's approval policy (default accept-edits).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Baton's port (default 8765, or 8767 with --native).",
+    )
     parser.add_argument("--env-file", type=Path, default=BATON / ".env")
     options = parser.parse_args()
+    port = options.port or (8767 if options.native else 8765)
 
     env = {**load_env_file(options.env_file), **os.environ}
     try:
@@ -250,16 +327,20 @@ def main() -> int:
     if not env.get("MISTRAL_API_KEY") and (key := keychain_api_key()):
         env["MISTRAL_API_KEY"] = key
     env |= {
-        "BATON_TOKEN": env.get("BATON_TOKEN") or secrets.token_urlsafe(16),
-        "PORT": str(options.port),
+        "BATON_TOKEN": env.get("BATON_TOKEN") or secrets.token_urlsafe(32),
+        "PORT": str(port),
+        "BATON_NATIVE_PORT": str(port),
         "VIBE_ACP_CMD": f"uv run --directory {shlex.quote(str(REPO))} vibe-acp",
-        "BATON_WS": f"ws://127.0.0.1:{options.port}/ws",
-        "BATON_HTTP": f"http://127.0.0.1:{options.port}",
+        "BATON_WS": f"ws://127.0.0.1:{port}/ws",
+        "BATON_HTTP": f"http://127.0.0.1:{port}",
         "TELEGRAM_CHAT_ID": str(operator),
     }
     workdir = options.cwd.resolve()
     workdir.mkdir(parents=True, exist_ok=True)
-    return run(env, workdir, options.port)
+    if options.native:
+        bridge_log = vibe_home() / "logs" / "baton-telegram-bridge.log"
+        return run_native(env, workdir, options.approval_policy, bridge_log)
+    return run(env, workdir, port)
 
 
 if __name__ == "__main__":

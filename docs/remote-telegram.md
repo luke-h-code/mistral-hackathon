@@ -56,7 +56,25 @@ button press against it, and `/start` cannot add anyone else.
 
 ## Run a session
 
-From the repository root:
+There are two ways. Both need the bot set up as below.
+
+### Work in Vibe, approve in Telegram (native)
+
+```sh
+uv run python remote/telegram_computer_use.py --native
+```
+
+This opens the normal Vibe terminal UI (your installed `vibe`) through Baton's
+`native.sh`. Work in it as usual, for example `/computer-use open Firefox and go
+to wikipedia.org`. Each approval Vibe would ask for in the terminal arrives in
+Telegram instead while the bridge is connected; with no bridge, the terminal
+dialog works as usual. Vibe runs with `--approval-policy=accept-edits`: file
+edits run without asking, read-only shell commands are approved by Baton, and
+computer-use actions and other commands come to Telegram. Pass
+`--approval-policy=ask` to get a card for every call. The bridge's log is in
+`~/.vibe/logs/baton-telegram-bridge.log`; quit Vibe to stop it.
+
+### Start from Telegram
 
 ```sh
 uv run python remote/telegram_computer_use.py
@@ -67,7 +85,7 @@ input tools ask first, warns if Vibe's cached tool list is out of date, then
 starts Baton's server on this checkout's `vibe-acp` and the Telegram bridge.
 Press `Ctrl+C` to stop both.
 
-In your chat with the bot:
+In your chat with the bot (this way):
 
 1. Send `/start` to confirm the link.
 2. Send `/new` to start a session, then your task, for example
@@ -83,7 +101,9 @@ Options:
 | Option | Default | Use |
 | --- | --- | --- |
 | `--cwd DIR` | `remote/baton/demo` | Folder the Vibe sessions work in. Vibe's file and shell tools act here, so keep it a disposable folder. |
-| `--port N` | `8765` | Port for Baton's server. |
+| `--native` | off | Open the Vibe terminal UI here and send its approvals to Telegram. |
+| `--approval-policy NAME` | `accept-edits` | With `--native`, Vibe's approval policy. |
+| `--port N` | `8765`, or `8767` with `--native` | Port for Baton. |
 | `--env-file FILE` | `remote/baton/.env` | Where to read the Telegram settings. Environment variables take precedence. |
 
 `MISTRAL_API_KEY` is read from the environment or, on macOS, from the keychain
@@ -96,7 +116,9 @@ entry Vibe stores. Baton uses it for its one-line risk summaries on each card.
   screenshots.
 - **Mistral** receives the tool arguments for Baton's risk summaries, in
   addition to the session itself.
-- **Baton's web page** also runs, on port 8765 on every network interface,
+- **Baton's access token** reaches the Vibe processes Baton starts, so the
+  model's shell could read it. Fine for a demo on a test Mac; not for real use.
+- **Baton's web page** also runs (in the "start from Telegram" mode), on port 8765 on every network interface,
   protected by a random access token printed at startup. Anyone on your network
   with the token can approve requests there too.
 - Approving on your phone does not move focus on the Mac, so keyboard input

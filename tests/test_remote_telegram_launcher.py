@@ -95,3 +95,32 @@ def test_env_file_reads_values_and_ignores_comments(tmp_path: Path) -> None:
 
     assert values == {"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_ID": "42"}
     assert _load().load_env_file(tmp_path / "missing") == {}
+
+
+def test_only_the_bridge_gets_the_telegram_settings() -> None:
+    env = {
+        "PATH": "/usr/bin",
+        "BATON_TOKEN": "shared",
+        "TELEGRAM_BOT_TOKEN": "123:secret",
+        "TELEGRAM_CHAT_ID": "42",
+    }
+
+    vibe_env, bridge_env = _load().split_env(env)
+
+    # Vibe's tools inherit vibe_env, so the model must not be able to read the bot.
+    assert vibe_env == {"PATH": "/usr/bin", "BATON_TOKEN": "shared"}
+    assert bridge_env == env
+
+
+def test_native_mode_opens_the_vibe_tui_through_batons_shim(tmp_path: Path) -> None:
+    launcher = _load()
+
+    command = launcher.native_command(tmp_path, "accept-edits")
+
+    assert command[:2] == ["bash", str(launcher.BATON / "native.sh")]
+    assert command[2:] == [
+        "--trust",
+        "--workdir",
+        str(tmp_path),
+        "--approval-policy=accept-edits",
+    ]
