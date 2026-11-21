@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import json
 from pathlib import Path
 import stat
 from types import ModuleType
@@ -28,7 +30,8 @@ case "$3" in
     fi ;;
   click) printf '{{"frontmost": 4242}}\\n' ;;
   drag) printf '{{"frontmost": 0}}\\n' ;;
-  type) cat > "{log}.stdin" ;;
+  type) cat > "{log}.stdin"; printf '{{"app": "Firefox"}}\\n' ;;
+  keys) printf '{{"app": "Firefox"}}\\n' ;;
   scroll) echo "Coordinates are outside the selected display." >&2; exit 1 ;;
 esac
 """
@@ -182,6 +185,93 @@ async def test_keyboard_input_goes_to_the_app_last_clicked(
         "display main keys enter 0",
     ]
     assert Path(f"{helper[1]}.stdin").read_text() == "hello\nworld"
+    texts = [result.content[0].text for result in results]
+    assert texts[2] == "Typed 11 characters into Firefox."
+    assert texts[3] == "Pressed cmd+shift+z in Firefox."
+
+
+def _write_cache(cache_dir: Path, name: str, source: str, descriptors: Any) -> Path:
+    path = cache_dir / name
+    path.write_text(
+        json.dumps({
+            "sourceName": source,
+            "discoveredAt": "2026-11-21T12:48:15.006813Z",
+            "descriptors": descriptors,
+        })
+    )
+    return path
+
+
+async def _live_descriptors(server: Any) -> list[dict[str, Any]]:
+    return [
+        {
+            "remoteName": tool.name,
+            "description": tool.description,
+            "inputSchema": tool.input_schema,
+        }
+        for tool in await server.list_tools()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_check_cache_reports_and_clears_a_stale_tool_list(
+    helper: tuple[Path, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = _load_server()
+    server = module.build_server([str(helper[0]), "display", "main"], "display")
+    live = await _live_descriptors(server)
+    # The list Vibe served in the chess session: four tools, older descriptions.
+    old = [
+        dict(tool)
+        for tool in live
+        if tool["remoteName"] in {"screenshot", "click", "drag"}
+    ]
+    old[0]["description"] = "Capture a PNG of the selected display."
+    old.append({"remoteName": "type", "description": "Type text.", "inputSchema": {}})
+    stale = _write_cache(tmp_path, "stale.json", "computer-use", old)
+    fresh = _write_cache(tmp_path, "fresh.json", "computer-use", live)
+    other = _write_cache(tmp_path, "other.json", "another-server", [])
+
+    assert (
+        await asyncio.to_thread(module.check_cache, server, "computer-use", tmp_path)
+        == 1
+    )
+    report = capsys.readouterr().out
+    assert "stale.json: stale" in report
+    for line in (
+        "missing tool press_keys",
+        "missing tool scroll",
+        "missing tool type_text",
+        "removed tool type",
+        "screenshot: description changed",
+        "until 2026-11-22 12:48 UTC",
+    ):
+        assert line in report
+    assert "fresh.json: up to date" in report
+    assert "other.json" not in report
+
+    assert (
+        await asyncio.to_thread(
+            module.check_cache, server, "computer-use", tmp_path, clear=True
+        )
+        == 0
+    )
+    assert not stale.exists()
+    assert fresh.exists() and other.exists()
+
+
+@pytest.mark.asyncio
+async def test_check_cache_without_an_entry_is_fine(
+    helper: tuple[Path, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = _load_server()
+    server = module.build_server([str(helper[0]), "display", "main"], "display")
+
+    assert (
+        await asyncio.to_thread(module.check_cache, server, "computer-use", tmp_path)
+        == 0
+    )
+    assert "No cached tool list" in capsys.readouterr().out
 
 
 @pytest.mark.asyncio

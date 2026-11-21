@@ -32,6 +32,8 @@
 </div>
 <p id="clicked" role="status">Waiting for a double- or right-click.</p>
 <p id="scrolled" role="status">Scroll the list to line 30.</p>
+<p><button id="locate" type="button">Ask for my location</button></p>
+<p id="located" role="status">The browser asks in a popup; press Escape to close it.</p>
 <script>
   const source = document.querySelector("#source");
   const target = document.querySelector("#target");
@@ -75,6 +77,16 @@
     p.textContent = "Line " + line;
     scroller.append(p);
   }
+  // Opens the browser's location prompt, a separate popup window, to test that
+  // keys such as Escape reach it.
+  document.querySelector("#locate").addEventListener("click", () => {
+    status("#located", "Location prompt opened.");
+    navigator.geolocation.getCurrentPosition(
+      () => status("#located", "Location shared."),
+      () => status("#located", "Location prompt closed without sharing."),
+    );
+  });
+
   // Done once line 30 is visible.
   scroller.addEventListener("scroll", () => {
     const line30 = scroller.children[29];

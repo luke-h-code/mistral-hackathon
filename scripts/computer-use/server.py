@@ -8,7 +8,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+from datetime import UTC, datetime, timedelta
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -87,6 +90,14 @@ class _Helper:
             )
         return result.stdout
 
+    def run_keyboard(self, *args: object, text: str = "") -> str:
+        """Run a typing or key action and return the app that received it."""
+        try:
+            app = json.loads(self.run(*args, text=text))["app"]
+        except (ValueError, KeyError, TypeError):
+            app = ""
+        return app if isinstance(app, str) and app else "the focused app"
+
     def run_pointer(self, *args: object) -> None:
         """Run a click or drag and remember the app it left frontmost."""
         try:
@@ -146,7 +157,6 @@ def build_server(target: list[str], label: Literal["display", "window"]) -> MCPS
             "For a small or crowded target, such as a desktop icon, take a cropped screenshot around it "
             "and convert its pixels to points as the crop's text describes before clicking or dragging. "
             "The top-left is (0, 0), x increases right, and y increases down. "
-            "The app running Vibe is off limits to input. "
             "If the image is unavailable or the target is unclear, ask the user to make it visible."
         ),
     )
@@ -304,22 +314,26 @@ def _add_keyboard_tools(
 ) -> None:
     if label == "display":
         note = (
-            "Keyboard input goes to the app you last clicked or dragged in, which is brought to the "
-            "front first. It never goes to the app running Vibe."
+            "Input goes to whatever has keyboard focus, popups and dialogs included. The app you last "
+            "clicked or dragged in is brought back to the front first. The result names the app that "
+            "received it."
         )
     else:
-        note = "The selected window is brought to the front first."
+        note = (
+            "The selected window is brought to the front first; input then goes to whatever has "
+            "keyboard focus, popups and dialogs included. The result names the app that received it."
+        )
 
     @server.tool(
         description=(
-            "Type literal text into the control that has keyboard focus. Click the intended field first. "
+            "Type literal text into whatever has keyboard focus. Click the intended field first. "
             f"Newlines press Enter and tabs press Tab. {note}"
         ),
         annotations=_INPUT,
     )
     def type_text(text: InputText) -> str:
-        helper.run("type", helper.keyboard_pid, text=text)
-        return f"Typed {len(text)} characters into the focused control."
+        app = helper.run_keyboard("type", helper.keyboard_pid, text=text)
+        return f"Typed {len(text)} characters into {app}."
 
     @server.tool(
         description=(
@@ -335,8 +349,83 @@ def _add_keyboard_tools(
             raise ToolError(
                 "keys takes key names joined with +, such as enter or cmd+shift+z."
             )
-        helper.run("keys", spec, helper.keyboard_pid)
-        return f"Pressed {spec}."
+        app = helper.run_keyboard("keys", spec, helper.keyboard_pid)
+        return f"Pressed {spec} in {app}."
+
+
+# Vibe keeps an MCP server's tool list for 24 hours from when it was discovered,
+# keyed by the server's command and arguments, so editing this file changes
+# nothing until the entry expires (vibe/core/tools/mcp/descriptor_cache.py).
+_CACHE_LIFETIME = timedelta(hours=24)
+
+
+def _default_cache_dir() -> Path:
+    home = os.environ.get("VIBE_HOME") or str(Path.home() / ".vibe")
+    return Path(home).expanduser() / "logs" / "mcp-descriptors" / "unified"
+
+
+def _cache_differences(cached: list[dict[str, Any]], live: list[MCPTool]) -> list[str]:
+    """How a cached tool list differs from the server's current one."""
+    old = {str(tool.get("remoteName")): tool for tool in cached}
+    new = {tool.name: tool for tool in live}
+    differences = [f"missing tool {name}" for name in sorted(set(new) - set(old))]
+    differences += [f"removed tool {name}" for name in sorted(set(old) - set(new))]
+    for name in sorted(set(old) & set(new)):
+        if old[name].get("description") != new[name].description:
+            differences.append(f"{name}: description changed")
+        old_schema = json.dumps(old[name].get("inputSchema"), sort_keys=True)
+        if old_schema != json.dumps(new[name].input_schema, sort_keys=True):
+            differences.append(f"{name}: arguments changed")
+    return differences
+
+
+def check_cache(
+    server: MCPServer, name: str, cache_dir: Path, *, clear: bool = False
+) -> int:
+    """Compare Vibe's cached tool list for `name` with this server's tools.
+
+    Prints what is out of date and returns 1 if a stale entry remains, else 0.
+    With `clear`, stale entries are deleted so Vibe rediscovers the tools.
+    """
+    live = asyncio.run(server.list_tools())
+    entries = []
+    for path in sorted(cache_dir.glob("*.json")):
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict) and record.get("sourceName") == name:
+            entries.append((path, record))
+    if not entries:
+        print(
+            f"No cached tool list for {name!r} in {cache_dir}. Vibe will discover the tools."
+        )
+        return 0
+    stale_left = 0
+    for path, record in entries:
+        discovered = record.get("discoveredAt", "unknown")
+        differences = _cache_differences(record.get("descriptors") or [], live)
+        if not differences:
+            print(f"{path.name}: up to date (discovered {discovered}).")
+            continue
+        print(f"{path.name}: stale (discovered {discovered}):")
+        for difference in differences:
+            print(f"  - {difference}")
+        try:
+            expires = datetime.fromisoformat(discovered) + _CACHE_LIFETIME
+            print(
+                f"  Vibe keeps using it until {expires.astimezone(UTC):%Y-%m-%d %H:%M} UTC."
+            )
+        except (TypeError, ValueError):
+            pass
+        if clear:
+            path.unlink(missing_ok=True)
+            print("  Deleted. Start a new Vibe session to rediscover the tools.")
+        else:
+            stale_left += 1
+    if stale_left:
+        print("Quit Vibe and rerun with --clear, then start a new session.")
+    return 1 if stale_left else 0
 
 
 def main() -> None:
@@ -348,7 +437,22 @@ def main() -> None:
     )
     selection.add_argument("--window", type=int, help="Window ID, used with --pid")
     parser.add_argument("--pid", type=int, help="Process ID of the selected window")
+    parser.add_argument(
+        "--check-cache",
+        action="store_true",
+        help="Compare Vibe's cached tool list with this server's tools and exit. "
+        "Pass the same arguments as the registration.",
+    )
+    parser.add_argument(
+        "--clear", action="store_true", help="With --check-cache, delete stale entries."
+    )
+    parser.add_argument(
+        "--name", default="computer-use", help="The registered server name."
+    )
+    parser.add_argument("--cache-dir", type=Path, default=None)
     options = parser.parse_args()
+    if options.clear and not options.check_cache:
+        parser.error("--clear is only used with --check-cache")
 
     helper = str(options.helper.resolve())
     if options.display is not None:
@@ -363,6 +467,11 @@ def main() -> None:
         if options.window <= 0 or options.pid is None or options.pid <= 0:
             parser.error("--window and --pid require positive numeric IDs")
         server = build_server([helper, str(options.window), str(options.pid)], "window")
+    if options.check_cache:
+        cache_dir = options.cache_dir or _default_cache_dir()
+        raise SystemExit(
+            check_cache(server, options.name, cache_dir, clear=options.clear)
+        )
     server.run()
 
 

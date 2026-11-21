@@ -1,68 +1,19 @@
+// The computer-use helper: captures the selected display or window and posts mouse
+// and keyboard input to it. Pure decisions live in Logic.swift. Build both:
+//   swiftc -parse-as-library Logic.swift WindowControl.swift -o window-control
+
 import AppKit
 import ApplicationServices
-import Darwin
 import ImageIO
 import ScreenCaptureKit
 import UniformTypeIdentifiers
 
-struct ControlError: LocalizedError {
-    let errorDescription: String?
-
-    init(_ message: String) {
-        errorDescription = message
-    }
-}
-
-// MARK: - The app running Vibe
-
-/// Processes the model may not click, drag on, scroll or type into: the terminal or
-/// app that runs Vibe, found through this helper's ancestors. Its windows hold the
-/// conversation and Vibe's approval prompts, so only the user may operate them.
-enum Protected {
-    static let pids: Set<pid_t> = compute()
-    static let message = "That is the app running Vibe. Only the user may operate it."
-
-    static func contains(_ pid: pid_t) -> Bool { pid > 0 && pids.contains(pid) }
-
-    private static func compute() -> Set<pid_t> {
-        var ancestors = Set<pid_t>()
-        var bundles = Set<String>()
-        var pid = getppid()
-        while pid > 1, ancestors.insert(pid).inserted {
-            if let bundle = outerBundle(of: pid) { bundles.insert(bundle) }
-            guard let parent = parentPID(of: pid) else { break }
-            pid = parent
-        }
-        // A terminal inside an app (VS Code, for example) runs in a helper process;
-        // the windows belong to the app's main process in the same bundle.
-        var result = ancestors
-        for app in NSWorkspace.shared.runningApplications {
-            if let path = app.bundleURL?.standardizedFileURL.path, bundles.contains(path) {
-                result.insert(app.processIdentifier)
-            }
-        }
-        return result
-    }
-
-    private static func parentPID(of pid: pid_t) -> pid_t? {
-        var info = kinfo_proc()
-        var size = MemoryLayout<kinfo_proc>.stride
-        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
-        guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0, size > 0 else { return nil }
-        return info.kp_eproc.e_ppid
-    }
-
-    private static func outerBundle(of pid: pid_t) -> String? {
-        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
-        guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { return nil }
-        let path = String(cString: buffer)
-        guard let end = path.range(of: ".app/") else { return nil }
-        return URL(fileURLWithPath: String(path[..<end.lowerBound]) + ".app").standardizedFileURL.path
-    }
+func frontmostApp() -> NSRunningApplication? {
+    NSWorkspace.shared.frontmostApplication
 }
 
 func frontmostPID() -> pid_t {
-    NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+    frontmostApp()?.processIdentifier ?? 0
 }
 
 // MARK: - Windows
@@ -102,6 +53,7 @@ struct Window {
         return window
     }
 
+    /// In window mode, pointer input must land on the selected window.
     func checkPointer(_ point: CGPoint, in windows: [Window]) throws {
         var displayCount: UInt32 = 0
         guard CGGetDisplaysWithPoint(point, 0, nil, &displayCount) == .success, displayCount > 0
@@ -115,17 +67,6 @@ struct Window {
         // The Dock and other overlays can cover the screen with transparent windows.
         guard hitTest(point) == pid
         else { throw ControlError("The target point is covered. Bring the selected window forward.") }
-    }
-
-    func checkFocus() throws {
-        let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 0.25)
-        guard frontmostPID() == pid,
-              let focused = attribute(app, kAXFocusedWindowAttribute),
-              CFGetTypeID(focused) == AXUIElementGetTypeID(),
-              matches(focused as! AXUIElement),
-              Window.onScreen().first(where: { $0.pid == pid && $0.layer == 0 })?.id == id
-        else { throw ControlError("Focus a text control in the selected window before typing.") }
     }
 
     /// Whether an accessibility window element has this window's frame.
@@ -166,14 +107,6 @@ func hitTest(_ point: CGPoint) -> pid_t {
           let element, AXUIElementGetPid(element, &pid) == .success
     else { return 0 }
     return pid
-}
-
-func checkNotProtected(_ point: CGPoint, windows: [Window]) throws {
-    let hit = hitTest(point)
-    let top = windows.first { $0.layer == 0 && $0.frame.contains(point) }
-    if Protected.contains(hit) || (hit == 0 && top.map { Protected.contains($0.pid) } == true) {
-        throw ControlError(Protected.message)
-    }
 }
 
 /// Ask macOS to make an app frontmost. A helper launched from a terminal cannot
@@ -219,11 +152,6 @@ enum Target {
         }
     }
 
-    var isDisplay: Bool {
-        if case .display = self { return true }
-        return false
-    }
-
     func point(_ x: String, _ y: String) throws -> CGPoint {
         guard let x = Int(x), let y = Int(y), x >= 0, y >= 0,
               CGFloat(x) < frame.width, CGFloat(y) < frame.height
@@ -235,10 +163,9 @@ enum Target {
         return CGPoint(x: frame.minX + CGFloat(x), y: frame.minY + CGFloat(y))
     }
 
-    /// Check that a pointer event at this point reaches the selected target.
-    /// `guardApps` also refuses points over the app running Vibe in display mode;
-    /// a drag checks that only at its ends, so its path may cross that app.
-    func checkPointer(_ point: CGPoint, windows: [Window]? = nil, guardApps: Bool = true) throws {
+    /// Check that a pointer event at this point reaches the selected target. In
+    /// display mode any point on the display is allowed, whichever app is there.
+    func checkPointer(_ point: CGPoint, windows: [Window]? = nil) throws {
         switch self {
         case .window(let window):
             let current = windows ?? Window.onScreen()
@@ -252,54 +179,25 @@ enum Target {
             guard frame.contains(point) else {
                 throw ControlError("Coordinates are outside the selected display.")
             }
-            if guardApps { try checkNotProtected(point, windows: windows ?? Window.onScreen()) }
         }
     }
 
-    /// The window that will receive keyboard input, brought to the front.
-    /// In display mode that is the app the model last clicked (`preferred`), or the
-    /// frontmost app when there is none, but never the app running Vibe: after the
-    /// user approves a call in Vibe, Vibe's terminal is usually frontmost.
-    func keyboardWindow(preferred: pid_t) throws -> Window {
-        switch self {
-        case .window(let window):
-            if frontmostPID() != window.pid { window.bringForward() }
-            return window
-        case .display(let id, let frame):
-            if preferred > 0, frontmostPID() != preferred, !Protected.contains(preferred),
-               NSRunningApplication(processIdentifier: preferred) != nil {
-                activate(preferred)
-                waitForFront(preferred, seconds: 1.5)
-            }
-            let front = frontmostPID()
-            guard front != 0, !Protected.contains(front) else {
-                throw ControlError(
-                    "The app running Vibe has keyboard focus. Click the target window or text field first."
-                )
-            }
-            guard CGDisplayIsActive(id) != 0, CGDisplayBounds(id) == frame,
-                  let window = Window.onScreen().first(where: { $0.pid == front && $0.layer == 0 }),
-                  frame.contains(CGPoint(x: window.frame.midX, y: window.frame.midY))
-            else { throw ControlError("Click a text field in a window on the selected display first.") }
-            return window
+    /// Prepare for keyboard input and return the name of the app that will get it.
+    /// The selected window, or in display mode the app last clicked (`preferred`),
+    /// is brought back to the front. Input then goes to whatever has focus there,
+    /// popups and dialogs included.
+    func prepareKeyboard(preferred: pid_t) -> String {
+        let wanted: pid_t
+        if case .window(let window) = self { wanted = window.pid } else { wanted = preferred }
+        let decision = keyboardTarget(
+            frontmost: frontmostPID(), preferred: wanted,
+            preferredRunning: NSRunningApplication(processIdentifier: wanted) != nil
+        )
+        if case .activate(let pid) = decision {
+            if case .window(let window) = self { window.bringForward() } else { activate(pid) }
+            waitForFront(pid, seconds: 1.5)
         }
-    }
-
-    /// A crop of the target, in its points, trimmed to its edges. Nil means all of it.
-    func region(_ args: ArraySlice<String>) throws -> CGRect? {
-        guard !args.isEmpty else { return nil }
-        let values = args.compactMap { Int($0) }
-        guard values.count == 4, args.count == 4, values[2] > 0, values[3] > 0
-        else { throw ControlError("A screenshot region is x, y, width and height in whole points.") }
-        let bounds = CGRect(x: 0, y: 0, width: frame.width.rounded(.up), height: frame.height.rounded(.up))
-        let crop = CGRect(x: values[0], y: values[1], width: values[2], height: values[3]).intersection(bounds)
-        guard !crop.isNull, crop.width >= 16, crop.height >= 16 else {
-            throw ControlError(
-                "The region must overlap the selected \(label) (\(Int(bounds.width)) × \(Int(bounds.height)) points) "
-                    + "by at least 16 × 16 points."
-            )
-        }
-        return crop
+        return frontmostApp()?.localizedName ?? "the focused app"
     }
 
     /// Writes a JSON line, then the image. The line has the target's size in points,
@@ -334,11 +232,7 @@ enum Target {
         let configuration = SCStreamConfiguration()
         var metadata = "{\"size\": [\(width), \(height)]"
         if let region {
-            // Enlarge a small crop so its targets are legible; on a Retina display the
-            // extra pixels are real detail, not interpolation. A larger crop is
-            // already legible, and enlarging it would only make the request heavier,
-            // so no crop is more than 1,000 pixels on its long side because of zoom.
-            let zoom = max(region.width, region.height) <= 500 ? 2 : 1
+            let zoom = cropZoom(region)
             configuration.sourceRect = region
             configuration.width = Int(region.width) * zoom
             configuration.height = Int(region.height) * zoom
@@ -374,148 +268,13 @@ enum Target {
     }
 }
 
-// MARK: - Keys
-
-struct Modifier: Equatable {
-    let flag: CGEventFlags
-    let keyCode: CGKeyCode
-
-    static let control = Modifier(flag: .maskControl, keyCode: 59)
-    static let option = Modifier(flag: .maskAlternate, keyCode: 58)
-    static let shift = Modifier(flag: .maskShift, keyCode: 56)
-    static let command = Modifier(flag: .maskCommand, keyCode: 55)
-    /// The order modifiers are pressed in, and released in reverse.
-    static let order = [control, option, shift, command]
-
-    init(flag: CGEventFlags, keyCode: CGKeyCode) {
-        self.flag = flag
-        self.keyCode = keyCode
-    }
-
-    init?(_ name: Substring) {
-        switch name {
-        case "ctrl", "control": self = .control
-        case "alt", "option", "opt": self = .option
-        case "shift": self = .shift
-        case "cmd", "command", "win", "super", "meta": self = .command
-        default: return nil
-        }
-    }
-
-    static func == (lhs: Modifier, rhs: Modifier) -> Bool { lhs.keyCode == rhs.keyCode }
-
-    /// Modifiers joined with `+`, such as `shift` or `cmd+alt`; `-` means none.
-    static func parseHold(_ spec: String) throws -> [Modifier] {
-        guard spec != "-" else { return [] }
-        var held: [Modifier] = []
-        for token in spec.split(separator: "+", omittingEmptySubsequences: false) {
-            guard let modifier = Modifier(token) else {
-                throw ControlError("hold takes modifier keys only: cmd, ctrl, alt or shift, joined with +.")
-            }
-            held.append(modifier)
-        }
-        return order.filter(held.contains)
-    }
-}
-
-struct KeyCombo {
-    let code: CGKeyCode
-    let flags: CGEventFlags
-
-    static let namedKeys: [String: CGKeyCode] = [
-        "enter": 36, "return": 36, "tab": 48, "space": 49, "backspace": 51, "esc": 53, "escape": 53,
-        "delete": 117, "del": 117, "forwarddelete": 117, "home": 115, "end": 119,
-        "pageup": 116, "pgup": 116, "pagedown": 121, "pgdn": 121,
-        "left": 123, "right": 124, "down": 125, "up": 126,
-        "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97,
-        "f7": 98, "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
-    ]
-
-    /// ANSI keyboard characters by virtual key code (Carbon's kVK_ANSI_*); NUL marks
-    /// codes that are not single characters.
-    static let ansiKeys: [Character: CGKeyCode] = {
-        let layout = Array("asdfhgzxcv\0bqweryt123465=97-80]ou[ip\0lj'k;\\,/nm.\0\0`")
-        var keys: [Character: CGKeyCode] = [:]
-        for (code, character) in layout.enumerated() where character != "\0" {
-            keys[character] = CGKeyCode(code)
-        }
-        return keys
-    }()
-
-    /// One key with optional modifiers, such as `enter`, `cmd+s` or `cmd+shift+4`.
-    static func parse(_ spec: String) throws -> KeyCombo {
-        var flags = CGEventFlags()
-        var code: CGKeyCode?
-        for token in spec.split(separator: "+", omittingEmptySubsequences: false) {
-            if let modifier = Modifier(token) {
-                flags.insert(modifier.flag)
-                continue
-            }
-            let key = namedKeys[String(token)] ?? (token.count == 1 ? ansiKeys[token.first!] : nil)
-            guard let key else {
-                throw ControlError(
-                    "Unknown key \"\(token)\". Use names such as cmd, ctrl, alt, shift, enter, esc, tab, "
-                        + "space, backspace, delete, up, f1-f12, a or 1, joined with +."
-                )
-            }
-            guard code == nil else {
-                throw ControlError("Press one key at a time, with any modifiers, such as cmd+s.")
-            }
-            code = key
-        }
-        guard let code else { throw ControlError("Name a key to press besides the modifiers.") }
-        return KeyCombo(code: code, flags: flags)
-    }
-}
+// MARK: - Events
 
 func keyEvent(_ code: CGKeyCode, down: Bool, flags: CGEventFlags = []) throws -> CGEvent {
     guard let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down)
     else { throw ControlError("Could not create a keyboard event.") }
     event.flags = flags
     return event
-}
-
-// MARK: - Mouse
-
-enum Button: String {
-    case left, right, middle
-
-    var cg: CGMouseButton {
-        switch self {
-        case .left: return .left
-        case .right: return .right
-        case .middle: return .center
-        }
-    }
-
-    var down: CGEventType {
-        switch self {
-        case .left: return .leftMouseDown
-        case .right: return .rightMouseDown
-        case .middle: return .otherMouseDown
-        }
-    }
-
-    var up: CGEventType {
-        switch self {
-        case .left: return .leftMouseUp
-        case .right: return .rightMouseUp
-        case .middle: return .otherMouseUp
-        }
-    }
-
-    var dragged: CGEventType {
-        switch self {
-        case .left: return .leftMouseDragged
-        case .right: return .rightMouseDragged
-        case .middle: return .otherMouseDragged
-        }
-    }
-
-    static func parse(_ name: String) throws -> Button {
-        guard let button = Button(rawValue: name) else { throw ControlError("button is left, right or middle.") }
-        return button
-    }
 }
 
 func mouseEvent(
@@ -555,6 +314,8 @@ func scroll(_ point: CGPoint, notches: Int32) throws {
     usleep(30_000)
 }
 
+/// In window mode every point of the path must be over the selected window; in
+/// display mode it only has to stay on the display.
 func drag(
     _ start: CGPoint, _ end: CGPoint, button: Button, steps requested: Int, hold: [Modifier], in target: Target
 ) throws {
@@ -568,11 +329,9 @@ func drag(
     }
     let initialWindows: [Window]? = if case .window = target { Window.onScreen() } else { nil }
     let deadline = DispatchTime.now() + .seconds(15)
-    try target.checkPointer(start, windows: initialWindows)
-    try target.checkPointer(end, windows: initialWindows)
-    for point in points.dropLast() {
+    for point in [start] + points {
         guard DispatchTime.now() < deadline else { throw ControlError("The drag path check timed out.") }
-        try target.checkPointer(point, windows: initialWindows, guardApps: false)
+        try target.checkPointer(point, windows: initialWindows)
     }
 
     // Held modifiers are pressed as keys and set on every mouse event, as the
@@ -607,85 +366,54 @@ func drag(
     for point in points {
         guard DispatchTime.now() < deadline else { throw ControlError("The drag timed out.") }
         usleep(18_000)
-        try target.checkPointer(point, guardApps: false)
+        try target.checkPointer(point)
         try mouseEvent(button.dragged, point, button, flags: flags).post(tap: .cghidEventTap)
         up.location = point
     }
 }
 
-/// Print the frontmost app after a click or drag, unless it is the app running
-/// Vibe: the server sends later keyboard input there.
+/// Print the frontmost app after a click or drag; the server sends later keyboard
+/// input there.
 func reportFrontmost() {
     usleep(150_000)
-    let pid = frontmostPID()
-    print("{\"frontmost\": \(Protected.contains(pid) ? 0 : pid)}")
+    print("{\"frontmost\": \(frontmostPID())}")
+}
+
+/// Print which app received keyboard input, so the model can tell where it went.
+func reportKeyboard(_ app: String) {
+    let name = (try? JSONSerialization.data(withJSONObject: ["app": app]))
+        .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    print(name)
 }
 
 // MARK: - Keyboard
 
-func waitForFocus(_ window: Window) throws {
-    let deadline = DispatchTime.now() + .seconds(5)
-    while true {
-        do {
-            try window.checkFocus()
-            return
-        } catch {
-            guard DispatchTime.now() < deadline else { throw error }
-            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
-        }
-    }
-}
-
-func typeText(_ text: String, in window: Window) throws {
-    try waitForFocus(window)
-    for (index, character) in text.enumerated() {
-        if index.isMultiple(of: 32) { try window.checkFocus() }
-        guard frontmostPID() == window.pid else { throw ControlError("Focus changed while typing.") }
-        if character == "\r" { continue }
-        if character == "\n" || character == "\r\n" || character == "\t" {
-            let code: CGKeyCode = character == "\t" ? 48 : 36
-            try keyEvent(code, down: true).postToPid(window.pid)
-            try keyEvent(code, down: false).postToPid(window.pid)
-        } else {
-            let units = Array(String(character).utf16)
+/// Typing goes through the system, like a real keyboard, so it reaches whatever
+/// has focus: a text field, a popup, a dialog or system UI.
+func typeText(_ text: String) throws {
+    for key in typedKeys(text) {
+        switch key {
+        case .key(let code):
+            try keyEvent(code, down: true).post(tap: .cghidEventTap)
+            try keyEvent(code, down: false).post(tap: .cghidEventTap)
+        case .unicode(let units):
             let down = try keyEvent(0, down: true)
             let up = try keyEvent(0, down: false)
             down.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
             up.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
-            down.postToPid(window.pid)
-            up.postToPid(window.pid)
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
         }
         usleep(8_000)
     }
 }
 
-/// In display mode the keys go through the system, so shortcuts such as cmd+tab
-/// work; in window mode they go only to the selected window's app.
-func pressKeys(_ combo: KeyCombo, in window: Window, systemWide: Bool) throws {
-    try waitForFocus(window)
-    let down = try keyEvent(combo.code, down: true, flags: combo.flags)
-    let up = try keyEvent(combo.code, down: false, flags: combo.flags)
-    guard frontmostPID() == window.pid else { throw ControlError("Focus changed before the keys were pressed.") }
-    if systemWide {
-        down.post(tap: .cghidEventTap)
-        usleep(20_000)
-        up.post(tap: .cghidEventTap)
-    } else {
-        down.postToPid(window.pid)
-        usleep(20_000)
-        up.postToPid(window.pid)
-    }
+/// Keys go through the system too, so shortcuts such as cmd+tab work.
+func pressKeys(_ combo: KeyCombo) throws {
+    try keyEvent(combo.code, down: true, flags: combo.flags).post(tap: .cghidEventTap)
+    usleep(20_000)
+    try keyEvent(combo.code, down: false, flags: combo.flags).post(tap: .cghidEventTap)
     usleep(30_000)
-}
-
-func readText() throws -> String {
-    let data = FileHandle.standardInput.readDataToEndOfFile()
-    guard let text = String(data: data, encoding: .utf8), !text.isEmpty, text.utf16.count <= 2_000
-    else { throw ControlError("Provide valid text of at most 2,000 UTF-16 units.") }
-    guard text.allSatisfy({ String($0).utf16.count <= 20 }) else {
-        throw ControlError("A text character is too long to send as a keyboard event.")
-    }
-    return text
 }
 
 // MARK: - Listing
@@ -736,7 +464,7 @@ enum Action {
             )
         case ("type", 2):
             guard let pid = pid_t(args[1]) else { throw ControlError("Provide a numeric process ID.") }
-            return .type(try readText(), pid)
+            return .type(try validateText(FileHandle.standardInput.readDataToEndOfFile()), pid)
         case ("keys", 3):
             guard let pid = pid_t(args[2]) else { throw ControlError("Provide a numeric process ID.") }
             return .keys(try KeyCombo.parse(args[1]), pid)
@@ -762,12 +490,6 @@ struct WindowControl {
                 try listDisplays()
                 return
             }
-            if args == ["protected"] {
-                for app in NSWorkspace.shared.runningApplications where Protected.contains(app.processIdentifier) {
-                    print("\(app.processIdentifier)\t\(app.localizedName ?? "")")
-                }
-                return
-            }
             guard args.count >= 3 else {
                 throw ControlError("Usage: window-control windows, displays, WINDOW PID ACTION, or display ID ACTION")
             }
@@ -785,16 +507,14 @@ struct WindowControl {
                 target = .window(try Window.selected(id, pid, in: Window.onScreen()))
             }
             if args[2] == "screenshot" {
-                try await target.screenshot(region: target.region(args[3...]))
+                let region = try cropRegion(Array(args[3...]), within: target.frame.size, label: target.label)
+                try await target.screenshot(region: region)
                 return
             }
 
             let action = try Action.parse(args[2...], for: target)
             guard AXIsProcessTrusted() && CGPreflightPostEventAccess() else {
                 throw ControlError("Grant Accessibility to the app running Vibe in System Settings.")
-            }
-            if case .window(let window) = target, Protected.contains(window.pid) {
-                throw ControlError("The selected window belongs to the app running Vibe. Select another window.")
             }
 
             switch action {
@@ -809,9 +529,13 @@ struct WindowControl {
                 try drag(start, end, button: button, steps: steps, hold: hold, in: target)
                 reportFrontmost()
             case .type(let text, let preferred):
-                try typeText(text, in: target.keyboardWindow(preferred: preferred))
+                let app = target.prepareKeyboard(preferred: preferred)
+                try typeText(text)
+                reportKeyboard(app)
             case .keys(let combo, let preferred):
-                try pressKeys(combo, in: target.keyboardWindow(preferred: preferred), systemWide: target.isDisplay)
+                let app = target.prepareKeyboard(preferred: preferred)
+                try pressKeys(combo)
+                reportKeyboard(app)
             }
         } catch {
             FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
