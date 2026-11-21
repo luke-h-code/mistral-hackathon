@@ -160,6 +160,11 @@ Take a fresh screenshot if the layout changes. Keep the target still and
 visible during a drag. The helper checks the path and releases the mouse button
 if the window moves or the path becomes obstructed.
 
+## Approve from Telegram
+
+To start computer-use sessions from Telegram and approve each action there, see
+[remote-telegram.md](remote-telegram.md).
+
 ## Security and limitations
 
 The tools can operate anything on the screen, including the terminal running

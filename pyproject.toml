@@ -319,8 +319,9 @@ max-nested-blocks = 5
 ignore_decorators = ["@*"]
 
 [tool.pytest.ini_options]
-# client-e2e is a standalone harness with its own pytest.ini; the main suite must not collect it.
-addopts = "-p pytest_vibe -vvvv -q -n auto --dist=loadgroup --durations=10 --import-mode=importlib --maxschedchunk=1 --ignore=client-e2e"
+# client-e2e is a standalone harness with its own pytest.ini, and remote/baton a vendored
+# project with its own dependencies and tests; the main suite must not collect either.
+addopts = "-p pytest_vibe -vvvv -q -n auto --dist=loadgroup --durations=10 --import-mode=importlib --maxschedchunk=1 --ignore=client-e2e --ignore=remote"
 timeout = 10
 markers = [
     "unified_supported: backend contract behavior implemented by the Unified Harness",
