@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Computer-use MCP demo</title>
+<style>
+  body { font: 18px system-ui; max-width: 34rem; margin: 3rem auto; padding: 0 1rem; }
+  label { display: block; margin-bottom: .5rem; }
+  input, button { font: inherit; padding: .5rem; }
+  .row { display: flex; align-items: center; gap: 3rem; margin-top: 2rem; }
+  .box { padding: 1.5rem; border-radius: .5rem; user-select: none; }
+  #source { background: #2452a4; color: white; cursor: grab; touch-action: none; }
+  #target { border: 2px dashed #56617a; }
+  #clicks { background: #e7ecf5; }
+  #scroller { height: 6rem; width: 12rem; overflow-y: scroll; border: 1px solid #56617a; padding: 0 .5rem; }
+</style>
+<h1>Computer-use MCP demo</h1>
+<form id="demo">
+  <label for="message">Message</label>
+  <input id="message" required>
+  <button>Submit</button>
+</form>
+<p id="submitted" role="status">No message submitted.</p>
+<p id="keys" role="status">No shortcut pressed.</p>
+<div class="row">
+  <div id="source" class="box">Drag me</div>
+  <div id="target" class="box">Drop here</div>
+</div>
+<p id="dropped" role="status">Waiting for a drag.</p>
+<div class="row">
+  <div id="clicks" class="box">Double- or right-click me</div>
+  <div id="scroller" tabindex="0"></div>
+</div>
+<p id="clicked" role="status">Waiting for a double- or right-click.</p>
+<p id="scrolled" role="status">Scroll the list to line 30.</p>
+<script>
+  const source = document.querySelector("#source");
+  const target = document.querySelector("#target");
+  const clicks = document.querySelector("#clicks");
+  const scroller = document.querySelector("#scroller");
+  const status = (id, text) => { document.querySelector(id).textContent = text; };
+
+  document.querySelector("#demo").addEventListener("submit", event => {
+    event.preventDefault();
+    status("#submitted", "Submitted: " + document.querySelector("#message").value);
+  });
+  // A shortcut with Command or Control, such as cmd+k, shows here.
+  document.addEventListener("keydown", event => {
+    if (!event.metaKey && !event.ctrlKey) return;
+    const parts = [event.metaKey && "cmd", event.ctrlKey && "ctrl", event.altKey && "alt",
+      event.shiftKey && "shift", event.key.toLowerCase()].filter(Boolean);
+    if (event.key.toLowerCase() === "k") event.preventDefault();
+    status("#keys", "Pressed: " + parts.join("+"));
+  });
+
+  source.addEventListener("pointerdown", event => {
+    source.setPointerCapture(event.pointerId);
+    source.style.cursor = "grabbing";
+  });
+  source.addEventListener("pointerup", event => {
+    const bounds = target.getBoundingClientRect();
+    const success = event.clientX >= bounds.left && event.clientX < bounds.right
+      && event.clientY >= bounds.top && event.clientY < bounds.bottom;
+    status("#dropped", success ? "Drag complete." + (event.shiftKey ? " Shift was held." : "") : "Drop missed.");
+  });
+  source.addEventListener("lostpointercapture", () => { source.style.cursor = "grab"; });
+
+  clicks.addEventListener("dblclick", () => status("#clicked", "Double-click received."));
+  clicks.addEventListener("contextmenu", event => {
+    event.preventDefault();
+    status("#clicked", "Right-click received.");
+  });
+
+  for (let line = 1; line <= 40; line++) {
+    const p = document.createElement("p");
+    p.textContent = "Line " + line;
+    scroller.append(p);
+  }
+  // Done once line 30 is visible.
+  scroller.addEventListener("scroll", () => {
+    const line30 = scroller.children[29];
+    const bottom = scroller.getBoundingClientRect().bottom;
+    if (line30.getBoundingClientRect().top < bottom) status("#scrolled", "Scrolled to line 30.");
+  });
+</script>
+</html>
